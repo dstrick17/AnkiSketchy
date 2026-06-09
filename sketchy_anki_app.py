@@ -22,6 +22,8 @@ import re
 import sqlite3
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +33,7 @@ from urllib.parse import urlparse
 
 APP_HOST = "127.0.0.1"
 APP_PORT = 8765
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -296,12 +299,13 @@ Phase 4 of the pacemaker cardiac action potential is marked by a slow, spontaneo
 
       <div class="actions">
         <button id="parseBtn">Parse symbols</button>
+        <button id="detectBtn" class="secondary" disabled>AI auto-detect crops</button>
         <button id="buildBtn" disabled>Build Anki deck</button>
       </div>
       <div id="status" class="status"></div>
 
       <p class="hint">
-        After parsing, choose a symbol number, then click its number bubble on the labeled image.
+        After parsing, choose a symbol number, then click the symbol center on the labeled image.
         The app crops from the clean image at the same spot. Edit the drafted front/answer/hook before export.
       </p>
     </section>
@@ -463,10 +467,84 @@ Phase 4 of the pacemaker cardiac action potential is marked by a slow, spontaneo
       renderCards();
       renderMarkers();
       $("buildBtn").disabled = false;
-      setStatus(`Parsed ${state.cards.length} symbols. Click each number bubble on the labeled image to place crops.`);
+      $("detectBtn").disabled = false;
+      setStatus(`Parsed ${state.cards.length} symbols. Click each symbol center on the labeled image to place crops.`);
     });
 
     $("nextUnplaced").addEventListener("click", selectNextUnplaced);
+
+    $("detectBtn").addEventListener("click", async () => {
+      if (!state.labeledDataUrl || !state.labeledImage) {
+        setStatus("Upload the labeled image before running AI crop detection.", true);
+        return;
+      }
+      if (!state.cards.length) {
+        setStatus("Parse the numbered symbol list before running AI crop detection.", true);
+        return;
+      }
+      setStatus("Asking AI to find the numbered symbol crops...");
+      $("detectBtn").disabled = true;
+      try {
+        const res = await fetch("/detect-crops", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            labeledImage: state.labeledDataUrl,
+            imageWidth: state.labeledImage.naturalWidth,
+            imageHeight: state.labeledImage.naturalHeight,
+            defaultCrop: Number($("defaultCrop").value || 260),
+            symbols: state.cards.map((card) => ({
+              number: card.number,
+              symbol: card.symbol,
+              meaning: card.meaning
+            }))
+          })
+        });
+        if (!res.ok) {
+          setStatus(await res.text(), true);
+          return;
+        }
+        const payload = await res.json();
+        const applied = applyDetections(payload.detections || []);
+        if (!applied) {
+          setStatus("AI did not return usable crop locations. You can still place them manually.", true);
+          return;
+        }
+        refreshAllPreviews();
+        renderMarkers();
+        setStatus(`AI suggested ${applied} crop locations. Please review the previews before building the deck.`);
+      } catch (err) {
+        setStatus(`Could not auto-detect crops: ${err}`, true);
+      } finally {
+        $("detectBtn").disabled = false;
+      }
+    });
+
+    function applyDetections(detections) {
+      let applied = 0;
+      for (const detection of detections) {
+        const card = state.cards.find((candidate) => candidate.number === Number(detection.number));
+        if (!card) continue;
+        const x = clampNumber(detection.x, 0, state.labeledImage.naturalWidth);
+        const y = clampNumber(detection.y, 0, state.labeledImage.naturalHeight);
+        const crop = clampNumber(detection.crop || $("defaultCrop").value, 80, 900);
+        if (x === null || y === null || crop === null) continue;
+        card.x = Math.round(x);
+        card.y = Math.round(y);
+        card.crop = Math.round(crop);
+        card.placed = true;
+        updateCardInputs(card);
+        updatePreview(card);
+        applied += 1;
+      }
+      return applied;
+    }
+
+    function clampNumber(value, min, max) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      return Math.max(min, Math.min(max, n));
+    }
 
     function renderSymbolSelect() {
       const sel = $("activeSymbol");
@@ -710,6 +788,155 @@ def anki_id() -> int:
 
 def json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def extract_response_text(payload: Dict[str, object]) -> str:
+    if isinstance(payload.get("output_text"), str):
+        return str(payload["output_text"])
+
+    pieces: List[str] = []
+    for item in payload.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []):
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str):
+                pieces.append(text)
+    return "".join(pieces).strip()
+
+
+def call_openai_for_crop_detections(
+    labeled_image: str,
+    symbols: List[Dict[str, object]],
+    image_width: int,
+    image_height: int,
+    default_crop: int,
+) -> Dict[str, object]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Set OPENAI_API_KEY in the terminal before using AI auto-detect crops.")
+
+    model = os.environ.get("SKETCHY_ANKI_OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    symbol_lines = "\n".join(
+        f'{item.get("number")}. {item.get("symbol", "")}: {item.get("meaning", "")}' for item in symbols
+    )
+    prompt = f"""You are helping build Anki cards from a Sketchy-style medical sketch.
+
+The image contains numbered labels next to visual symbols. For each requested number, estimate the crop center on the visual symbol of interest, not merely the printed number. The clean unnumbered image has the same layout, so coordinates must be in this labeled image's pixel coordinate system.
+
+Return one detection for every requested number you can find. Use a square crop size large enough to clearly show the symbol and immediate context, but keep it focused. If the symbol is tiny or close to other objects, use a slightly larger crop.
+
+Image size: {image_width} x {image_height} pixels.
+Default crop size: {default_crop}px.
+
+Requested numbered symbols:
+{symbol_lines}
+"""
+    schema = {
+        "type": "object",
+        "properties": {
+            "detections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "number": {"type": "integer"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "crop": {"type": "integer"},
+                        "confidence": {"type": "number"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["number", "x", "y", "crop", "confidence", "note"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["detections"],
+        "additionalProperties": False,
+    }
+    request_payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": labeled_image},
+                ],
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "sketchy_crop_detections",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+    }
+    body = json.dumps(request_payload).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API error ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach OpenAI API: {exc.reason}") from exc
+
+    output_text = extract_response_text(response_payload)
+    if not output_text:
+        raise RuntimeError("OpenAI returned no crop detection text.")
+    try:
+        return json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OpenAI returned invalid crop JSON: {output_text[:500]}") from exc
+
+
+def sanitize_crop_detections(
+    detections: Iterable[Dict[str, object]],
+    requested_numbers: Iterable[int],
+    image_width: int,
+    image_height: int,
+    default_crop: int,
+) -> List[Dict[str, object]]:
+    allowed = {int(number) for number in requested_numbers}
+    clean: List[Dict[str, object]] = []
+    for detection in detections:
+        try:
+            number = int(detection.get("number"))
+            if number not in allowed:
+                continue
+            x = max(0, min(image_width, int(round(float(detection.get("x"))))))
+            y = max(0, min(image_height, int(round(float(detection.get("y"))))))
+            crop = max(80, min(900, int(round(float(detection.get("crop", default_crop))))))
+            confidence = max(0.0, min(1.0, float(detection.get("confidence", 0))))
+        except (TypeError, ValueError):
+            continue
+        clean.append(
+            {
+                "number": number,
+                "x": x,
+                "y": y,
+                "crop": crop,
+                "confidence": confidence,
+                "note": str(detection.get("note", ""))[:240],
+            }
+        )
+    clean.sort(key=lambda item: item["number"])
+    return clean
 
 
 def create_schema(db: sqlite3.Connection) -> None:
@@ -993,6 +1220,9 @@ class SketchyAnkiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/detect-crops":
+            self.handle_detect_crops()
+            return
         if path != "/build":
             self.send_error(404)
             return
@@ -1022,6 +1252,49 @@ class SketchyAnkiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(apkg)))
         self.end_headers()
         self.wfile.write(apkg)
+
+    def handle_detect_crops(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            labeled_image = str(payload["labeledImage"])
+            data_url_to_bytes(labeled_image)
+            symbols = payload.get("symbols", [])
+            if not isinstance(symbols, list) or not symbols:
+                raise ValueError("Parse at least one symbol before detecting crops.")
+            image_width = int(payload.get("imageWidth", 0))
+            image_height = int(payload.get("imageHeight", 0))
+            default_crop = int(payload.get("defaultCrop", 260))
+            if image_width <= 0 or image_height <= 0:
+                raise ValueError("Image dimensions were missing.")
+
+            raw = call_openai_for_crop_detections(
+                labeled_image=labeled_image,
+                symbols=symbols,
+                image_width=image_width,
+                image_height=image_height,
+                default_crop=default_crop,
+            )
+            detections = raw.get("detections", [])
+            if not isinstance(detections, list):
+                raise ValueError("AI response did not include a detections list.")
+            requested_numbers = [int(item.get("number")) for item in symbols if isinstance(item, dict)]
+            clean = sanitize_crop_detections(detections, requested_numbers, image_width, image_height, default_crop)
+            body = json_dumps({"detections": clean}).encode("utf-8")
+        except Exception as exc:
+            message = f"Could not detect crops: {exc}".encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(message)))
+            self.end_headers()
+            self.wfile.write(message)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def main() -> None:
