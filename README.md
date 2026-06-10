@@ -5,6 +5,7 @@ Local Python app for turning labeled Sketchy-style images into Anki decks.
 ## What it does
 
 - Lets you upload images in the browser and label symbols on them.
+- Lets you paste screenshots directly into the labeled or clean image slots.
 - Can ask an OpenAI vision model to suggest crop centers for clearly numbered symbols.
 - Builds an Anki deck from the labeled content.
 - Keeps the uploaded images in the browser until you click **Build Anki deck**.
@@ -16,6 +17,15 @@ python3 sketchy_anki_app.py
 ```
 
 Then open the localhost URL printed in the terminal. By default the app runs on `127.0.0.1:8765`.
+
+## Images
+
+You can either upload image files or copy screenshots to your clipboard and use:
+
+- **Paste labeled screenshot** for the numbered sketch.
+- **Paste clean screenshot** for the matching unnumbered sketch.
+
+Clipboard image paste support depends on the browser, but it works best from a local `127.0.0.1` page in modern Chrome-based browsers.
 
 ## AI crop detection
 
@@ -33,6 +43,25 @@ Optional model override:
 ```bash
 export SKETCHY_ANKI_OPENAI_MODEL="gpt-5.5"
 ```
+
+## Symbol list format
+
+Paste numbered symbols like this:
+
+```text
+1.
+Drawbridge thick + thin planks:
+Sarcomeres are the contractile unit of the cell
+
+1
+2.
+Opening drawbridge/crossbridge:
+Actin-myosin cross-bridge cycling -> muscle cell contraction
+
+2
+```
+
+The repeated number after each description is okay; the parser treats it as copy-paste noise.
 
 ## Requirements
 

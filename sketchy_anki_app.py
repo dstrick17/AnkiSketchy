@@ -277,9 +277,15 @@ HTML_PAGE = r"""<!doctype html>
 
       <label for="labeledFile">Labeled sketch image</label>
       <input id="labeledFile" type="file" accept="image/*">
+      <div class="actions">
+        <button id="pasteLabeledBtn" type="button" class="secondary">Paste labeled screenshot</button>
+      </div>
 
       <label for="cleanFile">Unlabeled sketch image</label>
       <input id="cleanFile" type="file" accept="image/*">
+      <div class="actions">
+        <button id="pasteCleanBtn" type="button" class="secondary">Paste clean screenshot</button>
+      </div>
 
       <label for="symbolText">Numbered symbol list</label>
       <textarea id="symbolText" placeholder="1.
@@ -347,14 +353,22 @@ Phase 4 of the pacemaker cardiac action potential is marked by a slow, spontaneo
 
     function normalizeScienceText(text) {
       return text
+        .replace(/([A-Z][a-z]?)\s*\n\s*(\d+)\s*\n?\s*\+/g, "$1$2+")
+        .replace(/([A-Z][a-z]?)\s*\n\s*\+/g, "$1+")
         .replace(/Na\s*\n\s*\+/g, "Na+")
         .replace(/Ca\s*\n\s*2\s*\+/g, "Ca2+")
         .replace(/K\s*\n\s*\+/g, "K+")
+        .replace(/\]\s*\n\s*->/g, "] ->")
+        .replace(/\+\s*\n\s*-/g, "+-")
         .replace(/\s*→\s*/g, " -> ")
         .replace(/[ \t]+\n/g, "\n")
         .replace(/\n{2,}/g, "\n")
         .replace(/\s+/g, " ")
         .trim();
+    }
+
+    function stripTrailingCopyNumber(text, number) {
+      return text.replace(new RegExp("\\n\\s*" + number + "\\s*$"), "").trim();
     }
 
     function parseSymbols(raw) {
@@ -366,7 +380,7 @@ Phase 4 of the pacemaker cardiac action potential is marked by a slow, spontaneo
         const number = Number(match[1]);
         const symbol = match[2].trim();
         let meaning = match[3].trim();
-        meaning = meaning.replace(new RegExp("\\n\\s*" + number + "\\s*$"), "");
+        meaning = stripTrailingCopyNumber(meaning, number);
         meaning = normalizeScienceText(meaning);
         out.push(makeDraftCard(number, symbol, meaning));
       }
@@ -417,7 +431,7 @@ Phase 4 of the pacemaker cardiac action potential is marked by a slow, spontaneo
         meaning: clean,
         front,
         answer,
-        hook: `${symbol} = ${clean}`,
+        hook: clean,
         x: "",
         y: "",
         crop: Number($("defaultCrop").value || 260),
@@ -426,33 +440,72 @@ Phase 4 of the pacemaker cardiac action potential is marked by a slow, spontaneo
       };
     }
 
+    function loadImageDataUrl(dataUrl, callback) {
+      const img = new Image();
+      img.onload = () => callback(dataUrl, img);
+      img.src = dataUrl;
+    }
+
+    function readBlobAsImage(blob, callback) {
+      const reader = new FileReader();
+      reader.onload = () => loadImageDataUrl(reader.result, callback);
+      reader.readAsDataURL(blob);
+    }
+
     function readImageFile(input, callback) {
       const file = input.files && input.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const img = new Image();
-        img.onload = () => callback(reader.result, img);
-        img.src = reader.result;
-      };
-      reader.readAsDataURL(file);
+      readBlobAsImage(file, callback);
+    }
+
+    function setLabeledImage(dataUrl, img) {
+      state.labeledDataUrl = dataUrl;
+      state.labeledImage = img;
+      $("labeledImg").src = dataUrl;
+      renderMarkers();
+    }
+
+    function setCleanImage(dataUrl, img) {
+      state.cleanDataUrl = dataUrl;
+      state.cleanImage = img;
+      refreshAllPreviews();
+    }
+
+    async function pasteImageFromClipboard(callback, label) {
+      if (!navigator.clipboard || !navigator.clipboard.read) {
+        setStatus("This browser does not allow image clipboard reads here. Use the file picker instead.", true);
+        return;
+      }
+      try {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          const imageType = item.types.find((type) => type.startsWith("image/"));
+          if (!imageType) continue;
+          const blob = await item.getType(imageType);
+          readBlobAsImage(blob, callback);
+          setStatus(`Pasted ${label} screenshot.`);
+          return;
+        }
+        setStatus("Clipboard does not contain an image screenshot.", true);
+      } catch (err) {
+        setStatus(`Could not paste screenshot: ${err}`, true);
+      }
     }
 
     $("labeledFile").addEventListener("change", () => {
-      readImageFile($("labeledFile"), (dataUrl, img) => {
-        state.labeledDataUrl = dataUrl;
-        state.labeledImage = img;
-        $("labeledImg").src = dataUrl;
-        renderMarkers();
-      });
+      readImageFile($("labeledFile"), setLabeledImage);
     });
 
     $("cleanFile").addEventListener("change", () => {
-      readImageFile($("cleanFile"), (dataUrl, img) => {
-        state.cleanDataUrl = dataUrl;
-        state.cleanImage = img;
-        refreshAllPreviews();
-      });
+      readImageFile($("cleanFile"), setCleanImage);
+    });
+
+    $("pasteLabeledBtn").addEventListener("click", () => {
+      pasteImageFromClipboard(setLabeledImage, "labeled");
+    });
+
+    $("pasteCleanBtn").addEventListener("click", () => {
+      pasteImageFromClipboard(setCleanImage, "clean");
     });
 
     $("parseBtn").addEventListener("click", () => {
@@ -1046,8 +1099,9 @@ def insert_collection_metadata(db: sqlite3.Connection, deck_name: str, deck_id: 
             "css": (
                 ".card { font-family: Arial, sans-serif; font-size: 20px; text-align: left; color: #1d1d1f; "
                 "background-color: #ffffff; line-height: 1.35; }\n"
-                ".answer { font-size: 22px; font-weight: 700; }\n"
-                ".hook { margin-top: 12px; color: #333; }\n"
+                ".symbol-explainer { font-size: 23px; font-weight: 700; margin-bottom: 12px; }\n"
+                ".answer { font-size: 22px; font-weight: 700; margin-top: 12px; }\n"
+                ".hook { color: #333; }\n"
                 "img.symbol { max-width: 520px; width: 95%; border-radius: 6px; }\n"
                 "img.full-sketch { max-width: 900px; width: 100%; border-radius: 6px; }\n"
             ),
@@ -1115,13 +1169,13 @@ def insert_collection_metadata(db: sqlite3.Connection, deck_name: str, deck_id: 
     )
 
 
-def make_back_html(answer: str, hook: str, symbol_filename: str, full_filename: str) -> str:
+def make_back_html(number: str, symbol: str, answer: str, hook: str, symbol_filename: str, full_filename: str) -> str:
     return (
-        '<div class="answer">Answer: '
-        + html.escape(answer)
+        '<div class="symbol-explainer">'
+        + html.escape(f"{number}. {symbol}: {hook}")
         + "</div>"
-        + '<div class="hook"><b>Sketch memory hook:</b> '
-        + html.escape(hook)
+        + '<div class="answer">Answer: '
+        + html.escape(answer)
         + "</div><br>"
         + f'<img class="symbol" src="{html.escape(symbol_filename)}"><br><br>'
         + '<div><b>Full sketch:</b></div>'
@@ -1164,7 +1218,7 @@ def build_apkg(deck_name: str, tags: str, full_image: str, cards: Iterable[Dict[
                 media_map[media_index] = symbol_filename
                 media_files.append((media_index, data_url_to_bytes(str(card.get("symbolImage", "")))))
 
-                back = make_back_html(answer, hook, symbol_filename, full_filename)
+                back = make_back_html(number, symbol, answer, hook, symbol_filename, full_filename)
                 note_id = anki_id() + index
                 card_id = note_id + 100000
                 fields = front + "\x1f" + back
